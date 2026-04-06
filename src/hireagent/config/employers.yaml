@@ -1,0 +1,152 @@
+# Workday employer registry for HireAgent
+# US-only tech companies — focused on entry-level / new grad SWE roles
+
+employers:
+
+  # ── Big Tech ─────────────────────────────────────────────────────────────
+
+  salesforce:
+    name: "Salesforce"
+    tenant: "salesforce"
+    site_id: "External_Career_Site"
+    base_url: "https://salesforce.wd12.myworkdayjobs.com"
+
+  nvidia:
+    name: "NVIDIA"
+    tenant: "nvidia"
+    site_id: "NVIDIAExternalCareerSite"
+    base_url: "https://nvidia.wd5.myworkdayjobs.com"
+
+  cisco:
+    name: "Cisco"
+    tenant: "cisco"
+    site_id: "Cisco_Careers"
+    base_url: "https://cisco.wd5.myworkdayjobs.com"
+
+  intel:
+    name: "Intel"
+    tenant: "intel"
+    site_id: "External"
+    base_url: "https://intel.wd1.myworkdayjobs.com"
+
+  adobe:
+    name: "Adobe"
+    tenant: "adobe"
+    site_id: "external_experienced"
+    base_url: "https://adobe.wd5.myworkdayjobs.com"
+
+  uber:
+    name: "Uber"
+    tenant: "uber"
+    site_id: "uberCareers"
+    base_url: "https://uber.wd5.myworkdayjobs.com"
+
+  workday:
+    name: "Workday"
+    tenant: "workday"
+    site_id: "Workday"
+    base_url: "https://workday.wd5.myworkdayjobs.com"
+
+  servicenow:
+    name: "ServiceNow"
+    tenant: "servicenow"
+    site_id: "ServiceNowCareers"
+    base_url: "https://servicenow.wd1.myworkdayjobs.com"
+
+  docusign:
+    name: "DocuSign"
+    tenant: "docusign"
+    site_id: "External"
+    base_url: "https://docusign.wd5.myworkdayjobs.com"
+
+  motorola:
+    name: "Motorola Solutions"
+    tenant: "motorolasolutions"
+    site_id: "Careers"
+    base_url: "https://motorolasolutions.wd5.myworkdayjobs.com"
+
+  paypal:
+    name: "PayPal"
+    tenant: "paypal"
+    site_id: "jobs"
+    base_url: "https://paypal.wd1.myworkdayjobs.com"
+
+  mastercard:
+    name: "Mastercard"
+    tenant: "mastercard"
+    site_id: "CorporateCareers"
+    base_url: "https://mastercard.wd1.myworkdayjobs.com"
+
+  moderna:
+    name: "Moderna"
+    tenant: "modernatx"
+    site_id: "M_tx"
+    base_url: "https://modernatx.wd1.myworkdayjobs.com"
+
+  netflix:
+    name: "Netflix"
+    tenant: "netflix"
+    site_id: "Netflix"
+    base_url: "https://netflix.wd1.myworkdayjobs.com"
+
+  # ── Growth-stage / Mid-size US Tech ─────────────────────────────────────
+
+  twilio:
+    name: "Twilio"
+    tenant: "twilio"
+    site_id: "Twilio"
+    base_url: "https://twilio.wd5.myworkdayjobs.com"
+
+  crowdstrike:
+    name: "CrowdStrike"
+    tenant: "crowdstrike"
+    site_id: "crowdstrike"
+    base_url: "https://crowdstrike.wd5.myworkdayjobs.com"
+
+  palo_alto:
+    name: "Palo Alto Networks"
+    tenant: "paloaltonetworks"
+    site_id: "ExternalJobBoard"
+    base_url: "https://paloaltonetworks.wd1.myworkdayjobs.com"
+
+  fortinet:
+    name: "Fortinet"
+    tenant: "fortinet"
+    site_id: "careers"
+    base_url: "https://fortinet.wd3.myworkdayjobs.com"
+
+  splunk:
+    name: "Splunk"
+    tenant: "splunk"
+    site_id: "splunk"
+    base_url: "https://splunk.wd5.myworkdayjobs.com"
+
+  databricks:
+    name: "Databricks"
+    tenant: "databricks"
+    site_id: "External_Career_Site"
+    base_url: "https://databricks.wd5.myworkdayjobs.com"
+
+  confluent:
+    name: "Confluent"
+    tenant: "confluent"
+    site_id: "careers"
+    base_url: "https://confluent.wd5.myworkdayjobs.com"
+
+  elastic:
+    name: "Elastic"
+    tenant: "elastic"
+    site_id: "elastic"
+    base_url: "https://elastic.wd5.myworkdayjobs.com"
+
+  cloudflare:
+    name: "Cloudflare"
+    tenant: "cloudflare"
+    site_id: "careers"
+    base_url: "https://cloudflare.wd5.myworkdayjobs.com"
+
+  datadog:
+    name: "Datadog"
+    tenant: "datadog"
+    site_id: "careers"
+    base_url: "https://datadog.wd5.myworkdayjobs.com"

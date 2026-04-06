@@ -1,0 +1,116 @@
+{
+  "personal": {
+    "full_name": "Your Full Name",
+    "preferred_name": "Your Preferred Name",
+    "email": "your.email@example.com",
+    "phone": "+1(555)-000-0000",
+    "address": "123 Main Street",
+    "city": "City",
+    "province_state": "ST",
+    "country": "United States",
+    "postal_code": "00000",
+    "linkedin_url": "https://www.linkedin.com/in/yourprofile",
+    "github_url": "https://github.com/yourusername",
+    "portfolio_url": "https://yourportfolio.com"
+  },
+  "work_authorization": {
+    "legally_authorized_to_work": "Yes",
+    "require_sponsorship": "No",
+    "work_permit_type": ""
+  },
+  "availability": {
+    "earliest_start_date": "Immediately",
+    "available_for_full_time": "Yes",
+    "available_for_contract": "No",
+    "willing_to_relocate": "Yes"
+  },
+  "compensation": {
+    "salary_expectation": "90000",
+    "salary_currency": "USD",
+    "salary_range_min": "85000",
+    "salary_range_max": "115000"
+  },
+  "experience": {
+    "years_of_experience_total": "1",
+    "education_level": "Master's Degree",
+    "current_job_title": "",
+    "current_company": "",
+    "target_role": "software engineer"
+  },
+  "education": {
+    "masters": {
+      "school": "Your University",
+      "degree": "Master of Science",
+      "field_primary": "Computer Science",
+      "gpa": "4.0",
+      "start_date": "January 2025",
+      "end_date": "December 2025"
+    },
+    "bachelors": {
+      "school": "Your University",
+      "degree": "Bachelor of Science",
+      "field_primary": "Computer Science",
+      "gpa": "4.0",
+      "start_date": "August 2021",
+      "end_date": "December 2024"
+    }
+  },
+  "skills_boundary": {
+    "languages": ["Python", "Java", "JavaScript", "TypeScript", "C++", "SQL"],
+    "frontend": ["React", "HTML", "CSS", "Tailwind CSS"],
+    "backend": ["FastAPI", "Node.js", "Express", "REST APIs", "Microservices"],
+    "ai_ml": ["LLM Integration", "Prompt Engineering", "AI Agents", "NLP", "Ollama"],
+    "databases": ["PostgreSQL", "MySQL", "MongoDB", "SQLite"],
+    "devops": ["AWS", "Docker", "Kubernetes", "CI/CD", "Git", "GitHub Actions"]
+  },
+  "eeo_voluntary": {
+    "gender": "Decline to self-identify",
+    "race_ethnicity": "Decline to self-identify",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not have a disability"
+  },
+  "resume_facts": {
+    "preserved_companies": ["Company A", "Company B"],
+    "preserved_projects": ["Project 1", "Project 2"],
+    "preserved_school": "Your University",
+    "real_metrics": [
+      "X% reduction in Y",
+      "N users served",
+      "4.0 GPA"
+    ],
+    "writing_rules": [
+      "No em dashes — use hyphens or commas",
+      "No first-person pronouns in bullets",
+      "Bullet format: [Power Verb] + [What Was Built] + [Quantified Result]"
+    ],
+    "work_experiences": [
+      {
+        "id": "company_a",
+        "company": "Company A",
+        "role": "Software Engineering Intern",
+        "subtitle": "Brief description",
+        "timeline": "Jan 2024 - Dec 2024",
+        "tags": ["python", "fastapi", "backend"],
+        "bullets": [
+          "Built X using Y achieving Z result",
+          "Developed A pipeline reducing B by C%"
+        ],
+        "tech_stack": ["Python", "FastAPI", "PostgreSQL"]
+      }
+    ],
+    "projects_full": [
+      {
+        "id": "project_1",
+        "name": "Project Name",
+        "subtitle": "One-line description",
+        "category_label": "Category",
+        "tags": ["python", "react", "llm"],
+        "bullets": [
+          "Built X feature achieving Y result",
+          "Implemented Z improving performance by N%"
+        ],
+        "tech_stack": ["Python", "React", "LLM"]
+      }
+    ]
+  }
+}
