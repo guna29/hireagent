@@ -1965,6 +1965,11 @@ def _click_apply_cta(page, title: str) -> bool:
         "a.iCIMS_Button[href*='apply']",
         "#applyLink",
         ".careers-apply-button",
+        # Avature / Epic / generic "Upload" entry points
+        "button:text-matches('upload a resume', 'i')",
+        "a:text-matches('upload a resume', 'i')",
+        "button:text-matches('upload resume', 'i')",
+        "a:text-matches('upload resume', 'i')",
         # Generic fallback
         "button:text-matches('^apply$', 'i')",
         "a:text-matches('^apply$', 'i')",
@@ -2001,7 +2006,8 @@ def _click_apply_cta(page, title: str) -> bool:
             const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
             const kws = ['apply for this job', 'apply for this position', 'apply now',
                          'start application', 'begin application', 'apply online',
-                         'apply for job', 'apply to this job', 'apply for this role'];
+                         'apply for job', 'apply to this job', 'apply for this role',
+                         'upload a resume', 'upload resume', 'upload your resume'];
             for (const kw of kws) {
                 for (const el of all) {
                     const t = txt(el);
