@@ -420,7 +420,13 @@ _LABEL_MAP: list[tuple[str, str]] = [
     ("completion date",         "graduation_date_ms"),
     ("end date",                "graduation_date_ms"),
     ("graduation month",        "graduation_month"),
-    ("start date",              "start_date_ms"),
+    ("enrollment start date",   "start_date_ms"),   # MS enrollment (education context)
+    ("program start date",      "start_date_ms"),   # MS enrollment (education context)
+    # ── Availability (must be before generic "start date" in education block) ─
+    ("start date",              "availability"),
+    ("available to start",      "availability"),
+    ("earliest start",          "availability"),
+    ("when can you start",      "availability"),
     # ── Education ─────────────────────────────────────────────────────────────
     ("field of study",          "degree_field_ms"),
     ("major",                   "degree_field_ms"),
@@ -486,11 +492,7 @@ _LABEL_MAP: list[tuple[str, str]] = [
     ("visa",                    "work_permit"),
     ("work permit",             "work_permit"),
     ("citizenship",             "authorized"),
-    # ── Availability ──────────────────────────────────────────────────────────
-    ("start date",              "availability"),
-    ("available to start",      "availability"),
-    ("earliest start",          "availability"),
-    ("when can you start",      "availability"),
+    # ── Availability (start date entries moved above education block) ───────────
     ("willing to relocate",     "willing_to_relocate"),
     ("open to relocation",      "willing_to_relocate"),
     # ── EEO / Diversity ───────────────────────────────────────────────────────
@@ -588,7 +590,20 @@ def _fill_all_inputs(page, flat: dict, fast: bool = False) -> tuple[int, list[st
                 continue
             label = _label_for(page, inp)
             if not label:
-                continue  # can't map without a label
+                # No visible label — use name/placeholder as fallback identifier
+                # so the LLM can still attempt to fill it in the unknown-fields pass
+                fallback_id = (
+                    inp.get_attribute("name") or
+                    inp.get_attribute("placeholder") or
+                    inp.get_attribute("data-qa") or
+                    inp.get_attribute("id") or ""
+                ).strip()
+                if fallback_id:
+                    required = (inp.get_attribute("required") is not None or
+                                inp.get_attribute("aria-required") == "true")
+                    if required:
+                        unfilled.append(f"[unlabeled:{fallback_id}]")
+                continue
             value = _value_for_label(label, flat)
             if value:
                 current = ""
@@ -1100,7 +1115,7 @@ def _upload_resume(page, resume_path: Path) -> bool:
                 try:
                     inp.set_input_files(str(resume_path))
                     log.info("Resume uploaded via selector '%s': %s", selector, resume_path.name)
-                    page.wait_for_timeout(0)
+                    page.wait_for_timeout(1500)
                     return True
                 except Exception:
                     pass
@@ -1205,7 +1220,7 @@ def _linkedin_login_if_needed(page, flat: dict, job_url: str) -> None:
                 if btn.is_visible(timeout=1000):
                     btn.click()
                     log.info("LinkedIn sign-in button clicked (%s)", sel)
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(7000)
                     signed_in = True
                     break
             except Exception:
@@ -1221,16 +1236,51 @@ def _linkedin_login_if_needed(page, flat: dict, job_url: str) -> None:
             }""")
             if r and r != "none":
                 log.info("LinkedIn sign-in via JS fallback: %s", r)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(7000)
                 signed_in = True
 
         if signed_in:
+            # ── Check for CAPTCHA after login (LinkedIn anti-bot) ──
+            # LinkedIn commonly presents a CAPTCHA right after clicking Sign In.
+            try:
+                captcha_post_login = page.evaluate("""() => {
+                    const frames = Array.from(document.querySelectorAll('iframe'));
+                    for (const f of frames) {
+                        const src = (f.src || '').toLowerCase();
+                        const isHcaptcha = src.includes('hcaptcha.com');
+                        const isRcV2 = src.includes('api2/bframe') || src.includes('api2/anchor');
+                        if (isHcaptcha || isRcV2) {
+                            const r = f.getBoundingClientRect();
+                            if (r.width > 10 && r.height > 10) return true;
+                        }
+                    }
+                    if (document.querySelector('.h-captcha[data-sitekey]')) return true;
+                    // LinkedIn security check page
+                    const body = (document.body.innerText || '').toLowerCase();
+                    if (body.includes('security verification') || body.includes('verify you are a human'))
+                        return true;
+                    return false;
+                }""")
+                if captcha_post_login:
+                    log.info("CAPTCHA detected after LinkedIn login — attempting solve...")
+                    for _solve_attempt in range(2):
+                        solved = _solve_captcha(page, page.url)
+                        if solved:
+                            log.info("Post-login CAPTCHA solved (attempt %d)", _solve_attempt + 1)
+                            page.wait_for_timeout(3000)  # Let page process token
+                            break
+                        page.wait_for_timeout(2000)
+                    else:
+                        log.warning("Post-login CAPTCHA unsolvable — continuing anyway")
+            except Exception as _cap_err:
+                log.debug("Post-login CAPTCHA check error: %s", _cap_err)
+
             # After login LinkedIn redirects to feed — navigate back to job
             current = page.url
             if "linkedin.com/jobs/view" not in current and job_url:
                 log.info("Navigating back to job page after login: %s", job_url)
                 page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_timeout(0)
+                page.wait_for_timeout(3000)
         else:
             log.warning("LinkedIn sign-in button not clicked — may not be logged in")
     except Exception as e:
@@ -1248,9 +1298,91 @@ def _linkedin_dismiss_overlays(page) -> None:
             btn = page.locator(dismiss_sel).first
             if btn.is_visible(timeout=400):
                 btn.click()
-                page.wait_for_timeout(0)
+                page.wait_for_timeout(500)
         except Exception:
             pass
+
+
+def _linkedin_click_continue_applying(page, pages_before: set, context) -> str | None:
+    """Check for and click LinkedIn's 'Job search safety reminder' modal.
+
+    LinkedIn shows this modal after clicking an external Apply button:
+      'Job search safety reminder' with 'Continue applying ↗' button.
+    Clicking 'Continue applying' opens the external ATS in a new tab.
+
+    Returns 'external:<url>' if a new tab opened, None otherwise.
+    """
+    # Use has-text (substring match) not text-is (exact), because the button
+    # contains an SVG external-link icon that may add whitespace to innerText.
+    CONTINUE_SELS = [
+        "button:has-text('Continue applying')",
+        "a:has-text('Continue applying')",
+        "button:has-text('continue applying')",
+        "a:has-text('continue applying')",
+        "[data-test-job-safety-reminder-modal] button",
+        "[aria-label*='Continue applying' i]",
+    ]
+    for sel in CONTINUE_SELS:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                log.info("LinkedIn safety reminder modal detected — clicking 'Continue applying' via: %s", sel)
+                btn.click()
+                # Wait for external tab to open (up to 8s)
+                for _w in [1000, 1000, 1500, 2000, 2500]:
+                    page.wait_for_timeout(_w)
+                    new_pages = [p for p in context.pages if id(p) not in pages_before]
+                    if new_pages:
+                        new_page = new_pages[-1]
+                        try:
+                            new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                        except Exception:
+                            pass
+                        log.info("LinkedIn safety modal → Continue applying → new tab: %s", new_page.url)
+                        return 'external:' + new_page.url
+                # Tab may have opened before we captured pages_before — check current pages
+                all_new = [p for p in context.pages if id(p) not in pages_before]
+                if all_new:
+                    new_page = all_new[-1]
+                    return 'external:' + new_page.url
+                return None
+        except Exception:
+            pass
+
+    # JS fallback — find any visible button/link containing "continue applying" text
+    try:
+        clicked = page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const el of els) {
+                const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+                    .trim().toLowerCase();
+                if (t.includes('continue applying')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        el.click();
+                        return 'clicked:' + t.slice(0, 50);
+                    }
+                }
+            }
+            return null;
+        }""")
+        if clicked:
+            log.info("LinkedIn safety modal → JS fallback clicked: %s", clicked)
+            for _w in [1000, 1500, 2000, 2500]:
+                page.wait_for_timeout(_w)
+                new_pages = [p for p in context.pages if id(p) not in pages_before]
+                if new_pages:
+                    new_page = new_pages[-1]
+                    try:
+                        new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                    except Exception:
+                        pass
+                    log.info("LinkedIn safety modal JS → new tab: %s", new_page.url)
+                    return 'external:' + new_page.url
+    except Exception as _e:
+        log.debug("Safety modal JS fallback error: %s", _e)
+
+    return None
 
 
 def _linkedin_click_apply(page, title: str, context) -> str:
@@ -1268,28 +1400,32 @@ def _linkedin_click_apply(page, title: str, context) -> str:
     # LinkedIn's React renders the job content async — wait until Apply button
     # area OR job title is visible before scanning.
     JOB_CONTENT_SELS = [
-        ".jobs-apply-button",
-        ".jobs-apply-button--top-card",
         "button[aria-label*='Easy Apply' i]",
         "button[aria-label*='Apply' i]",
+        ".jobs-apply-button",
+        ".jobs-apply-button--top-card",
+        ".jobs-s-apply-button",
         ".job-details-jobs-unified-top-card__job-title",
-        "h1.job-title",
         ".jobs-unified-top-card__job-title",
+        "h1",
+        ".job-view-layout",
+        "main[role='main']",
     ]
     content_loaded = False
-    for _wait_attempt in range(3):  # up to 3 × 3s = 9s extra wait
+    for _wait_attempt in range(4):  # up to 4 × 3s = 12s extra wait
         for sel in JOB_CONTENT_SELS:
             try:
                 el = page.locator(sel).first
-                if el.is_visible(timeout=2000):
+                if el.is_visible(timeout=3000):
                     content_loaded = True
+                    log.info("LinkedIn job content visible via: %s", sel)
                     break
             except Exception:
                 pass
         if content_loaded:
             break
         log.info("LinkedIn job content not yet visible (attempt %d) — waiting 3s", _wait_attempt + 1)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(3000)
 
     # Always check if job is expired/closed (LinkedIn shows this banner even when content loads)
     try:
@@ -1329,7 +1465,21 @@ def _linkedin_click_apply(page, title: str, context) -> str:
         pass
 
     if not content_loaded:
-        log.warning("LinkedIn: job detail panel never loaded for '%s' — page may require login", title)
+        log.warning("LinkedIn: job detail panel never loaded for '%s' — proceeding anyway", title)
+        # Don't bail — proceed anyway. The apply button may still be clickable
+        # even if our content-loaded selectors didn't match (LinkedIn CSS changes).
+        content_loaded = True
+
+    # Give the Apply button a few extra seconds to render — LinkedIn lazy-loads the action buttons.
+    if content_loaded:
+        try:
+            page.locator(
+                "button[aria-label*='Apply' i], .jobs-apply-button, "
+                ".jobs-apply-button--top-card, .jobs-s-apply-button"
+            ).first.wait_for(state="visible", timeout=6000)
+            log.info("LinkedIn Apply button rendered and visible")
+        except Exception:
+            log.info("LinkedIn Apply button not yet visible after extra wait — will still attempt scan")
 
     # Snapshot pages before click
     pages_before = set(id(p) for p in context.pages)
@@ -1349,7 +1499,7 @@ def _linkedin_click_apply(page, title: str, context) -> str:
     for kind, sel in APPLY_LOCATORS:
         try:
             btn = page.locator(sel).first
-            if btn.is_visible(timeout=1000):
+            if btn.is_visible(timeout=5000):
                 btn_text = (btn.inner_text() or btn.get_attribute("aria-label") or "").strip()
                 # Skip Save, Save job, etc.
                 if any(s in btn_text.lower() for s in ("save", "sign in", "log in", "follow")):
@@ -1358,90 +1508,160 @@ def _linkedin_click_apply(page, title: str, context) -> str:
                 btn.click()
                 log.info("LinkedIn '%s' clicked via PW locator (%s): '%s'", kind, sel[:50], btn_text[:40])
                 if kind == "easy_apply":
-                    page.wait_for_timeout(0)
+                    page.wait_for_timeout(2000)
                     return 'easy_apply'
                 # Regular apply — wait for new tab or page navigation
-                page.wait_for_timeout(1000)
-                new_pages = [p for p in context.pages if id(p) not in pages_before]
-                if new_pages:
-                    new_page = new_pages[-1]
-                    try:
-                        new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
-                    except Exception:
-                        pass
-                    log.info("LinkedIn Apply → new tab: %s", new_page.url)
-                    return 'external:' + new_page.url
+                # LinkedIn external Apply opens a new tab, but can take several seconds.
+                # LinkedIn may also show a "Job search safety reminder" modal that must
+                # be dismissed by clicking "Continue applying ↗" before the tab opens.
+                for _wait_ms in [800, 800, 800]:  # quick initial check (2.4s)
+                    page.wait_for_timeout(_wait_ms)
+                    new_pages = [p for p in context.pages if id(p) not in pages_before]
+                    if new_pages:
+                        new_page = new_pages[-1]
+                        try:
+                            new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                        except Exception:
+                            pass
+                        log.info("LinkedIn Apply → new tab: %s", new_page.url)
+                        return 'external:' + new_page.url
+                # No tab yet — check for safety reminder modal and click Continue
+                safety_result = _linkedin_click_continue_applying(page, pages_before, context)
+                if safety_result:
+                    return safety_result
+                # Still no tab — wait a bit more
+                for _wait_ms in [1500, 2000, 2000]:
+                    page.wait_for_timeout(_wait_ms)
+                    new_pages = [p for p in context.pages if id(p) not in pages_before]
+                    if new_pages:
+                        new_page = new_pages[-1]
+                        try:
+                            new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                        except Exception:
+                            pass
+                        log.info("LinkedIn Apply → new tab (delayed): %s", new_page.url)
+                        return 'external:' + new_page.url
                 cur = page.url
                 if "linkedin.com" not in cur:
                     return 'external:' + cur
-                # Sometimes it opens a new tab after a slight delay — wait a bit more
-                page.wait_for_timeout(500)
-                new_pages = [p for p in context.pages if id(p) not in pages_before]
-                if new_pages:
-                    new_page = new_pages[-1]
-                    try:
-                        new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
-                    except Exception:
-                        pass
-                    log.info("LinkedIn Apply → new tab (delayed): %s", new_page.url)
-                    return 'external:' + new_page.url
+                # Button was clicked but no external tab opened — stop trying other selectors
+                log.info("LinkedIn Apply button clicked but no new tab for '%s' — stopping selector scan", title)
+                break
         except Exception:
             pass
 
-    # ── JS fallback scan ──
+    # ── JS fallback scan — ONLY look inside the main job detail panel ──
+    # LinkedIn shows many job cards in sidebar — we must only click the MAIN job's button.
+    # The main job detail panel is inside specific containers.
     result = page.evaluate("""() => {
-        const all = Array.from(document.querySelectorAll(
-            'button, [role="button"], a, .artdeco-button'
-        ));
-        const visible = el => {
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-        };
-        // Strip icon characters and extra whitespace; keep only ASCII-ish text
         const txt = el => {
             const raw = (el.getAttribute('aria-label') || el.innerText || el.textContent || '')
-                .replace(/[^\\x20-\\x7E]/g, ' ')  // strip non-ASCII (icons like ↗)
+                .replace(/[^\\x20-\\x7E]/g, ' ')
                 .trim().toLowerCase().replace(/\\s+/g, ' ');
             return raw;
         };
+        const inViewport = el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.bottom > 0;
+        };
         const SKIP = new Set(['save', 'save job', 'follow', 'sign in', 'log in']);
-        // Priority 1: Easy Apply
-        for (const el of all) {
-            const t = txt(el);
-            if (visible(el) && !SKIP.has(t) && t.includes('easy apply')) {
-                el.click();
-                return 'ea:' + t.slice(0, 40);
+
+        // --- Priority 0: find button INSIDE the main job top-card panel only ---
+        const TOP_CARD_SELS = [
+            '.jobs-apply-button--top-card',
+            '.jobs-s-apply-button',
+            '.jobs-unified-top-card__content--two-pane',
+            '.job-view-layout',
+            '.jobs-details__main-content',
+            '.jobs-details',
+            'main',
+        ];
+        for (const containerSel of TOP_CARD_SELS) {
+            const container = document.querySelector(containerSel);
+            if (!container) continue;
+            const btns = Array.from(container.querySelectorAll('button, [role="button"]'));
+            for (const el of btns) {
+                const t = txt(el);
+                if (SKIP.has(t) || !inViewport(el)) continue;
+                if (t === 'easy apply' || t.endsWith(': easy apply') || t.startsWith('easy apply')) {
+                    el.click(); return 'ea:main:' + t.slice(0, 40);
+                }
+                if (t === 'apply' || t.startsWith('apply ') || t.startsWith('apply:')) {
+                    if (!t.includes('easy')) { el.click(); return 'apply:main:' + t.slice(0, 40); }
+                }
             }
         }
-        // Priority 2: Regular Apply (starts with "apply", not "easy apply")
+
+        // --- Priority 1: scroll to top and look for the very first Easy Apply ---
+        window.scrollTo(0, 0);
+        const all = Array.from(document.querySelectorAll('button, [role="button"]'));
+        // Sort by vertical position — top of page first
+        all.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
         for (const el of all) {
             const t = txt(el);
-            if (visible(el) && !SKIP.has(t) && t.startsWith('apply') && !t.includes('easy')) {
-                el.click();
-                return 'apply:' + t.slice(0, 40);
+            if (SKIP.has(t)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            // Only within first 600px of page (top card area)
+            if (r.top > 600) break;
+            if (t === 'easy apply' || t.endsWith(': easy apply') || t.startsWith('easy apply')) {
+                el.click(); return 'ea:topzone:' + t.slice(0, 40);
+            }
+            if ((t === 'apply' || t.startsWith('apply ')) && !t.includes('easy')) {
+                el.click(); return 'apply:topzone:' + t.slice(0, 40);
             }
         }
-        const dbg = all.filter(visible).map(e => txt(e).slice(0, 30)).filter(Boolean);
+
+        // --- Priority 2: any Easy Apply button in viewport ---
+        for (const el of all) {
+            const t = txt(el);
+            if (SKIP.has(t) || !inViewport(el)) continue;
+            if (t.includes('easy apply')) { el.click(); return 'ea:any:' + t.slice(0, 40); }
+        }
+        for (const el of all) {
+            const t = txt(el);
+            if (SKIP.has(t) || !inViewport(el)) continue;
+            if (t.startsWith('apply') && !t.includes('easy')) { el.click(); return 'apply:any:' + t.slice(0, 40); }
+        }
+
+        const dbg = all.filter(inViewport).map(e => txt(e).slice(0, 30)).filter(Boolean);
         return 'none|buttons:' + dbg.slice(0, 20).join(',');
     }""")
 
     log.info("LinkedIn JS scan for '%s': %s", title, (result or "null")[:120])
 
     if result and result.startswith('ea:'):
-        page.wait_for_timeout(0)
+        page.wait_for_timeout(1500)
         return 'easy_apply'
 
     if result and result.startswith('apply:'):
-        page.wait_for_timeout(0)
-        new_pages = [p for p in context.pages if id(p) not in pages_before]
-        if new_pages:
-            new_page = new_pages[-1]
-            try:
-                new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            except Exception:
-                pass
-            log.info("LinkedIn Apply → new tab: %s", new_page.url)
-            return 'external:' + new_page.url
+        # External Apply clicked via JS — quick check, then safety modal, then longer wait
+        for _w in [800, 800, 800]:
+            page.wait_for_timeout(_w)
+            new_pages = [p for p in context.pages if id(p) not in pages_before]
+            if new_pages:
+                new_page = new_pages[-1]
+                try:
+                    new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:
+                    pass
+                log.info("LinkedIn Apply → new tab (JS): %s", new_page.url)
+                return 'external:' + new_page.url
+        # Check for safety reminder modal
+        safety_result = _linkedin_click_continue_applying(page, pages_before, context)
+        if safety_result:
+            return safety_result
+        for _w in [1500, 2000, 2500]:
+            page.wait_for_timeout(_w)
+            new_pages = [p for p in context.pages if id(p) not in pages_before]
+            if new_pages:
+                new_page = new_pages[-1]
+                try:
+                    new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:
+                    pass
+                log.info("LinkedIn Apply → new tab (JS delayed): %s", new_page.url)
+                return 'external:' + new_page.url
         cur = page.url
         if "linkedin.com" not in cur:
             return 'external:' + cur
@@ -1451,8 +1671,19 @@ def _linkedin_click_apply(page, title: str, context) -> str:
 
 
 def _solve_captcha(page, page_url: str) -> bool:
-    """Detect and solve a captcha on the page using CapSolver API.
-    Returns True if solved and token injected, False if unsolvable or key missing."""
+    """Detect and solve a captcha on the page.
+
+    Delegates to CaptchaSolver (enterprise-aware, supports pageAction/userAgent).
+    Kept as a module-level function so existing callers continue to work.
+    """
+    try:
+        from hireagent.apply.vision_loop import CaptchaSolver
+        solver = CaptchaSolver()
+        return solver.solve(page, page_url)
+    except Exception as exc:
+        log.warning("CaptchaSolver delegation error: %s — falling back to legacy impl", exc)
+
+    # ── Legacy fallback (original implementation) ───────────────────────────
     import urllib.request as _urllib_req
 
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
@@ -1476,16 +1707,34 @@ def _solve_captcha(page, page_url: str) -> bool:
                 if (sk) return {type: 'hcaptcha', sitekey: sk};
             } catch(e) {}
         }
-        // reCAPTCHA v2
+        // reCAPTCHA v2 / Enterprise (api2 or enterprise endpoint)
         const rcDiv = document.querySelector('.g-recaptcha[data-sitekey]');
         if (rcDiv) return {type: 'recaptchav2', sitekey: rcDiv.getAttribute('data-sitekey')};
-        const rcFrame = document.querySelector('iframe[src*="recaptcha/api2"]');
-        if (rcFrame) {
-            try {
-                const u = new URL(rcFrame.src);
-                const sk = u.searchParams.get('k') || '';
-                if (sk) return {type: 'recaptchav2', sitekey: sk};
-            } catch(e) {}
+        const rcFrameSelectors = [
+            'iframe[src*="recaptcha/api2"]',
+            'iframe[src*="recaptcha/enterprise"]',
+            'iframe[src*="google.com/recaptcha"]',
+        ];
+        for (const fSel of rcFrameSelectors) {
+            const rcFrame = document.querySelector(fSel);
+            if (rcFrame) {
+                try {
+                    const u = new URL(rcFrame.src);
+                    const sk = u.searchParams.get('k') || u.searchParams.get('sitekey') || '';
+                    if (sk) {
+                        const isEnterprise = rcFrame.src.includes('enterprise');
+                        return {type: isEnterprise ? 'recaptchav2enterprise' : 'recaptchav2', sitekey: sk};
+                    }
+                } catch(e) {}
+            }
+        }
+        // reCAPTCHA sitekey embedded in page JS (grep inline scripts)
+        const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+        for (const s of scripts) {
+            const m = s.textContent.match(/['"]sitekey['"] *: *['"]([0-9A-Za-z_-]{20,60})['"]/);
+            if (m) return {type: 'recaptchav2', sitekey: m[1]};
+            const m2 = s.textContent.match(/grecaptcha[.]render[(][^)]+['"]([0-9A-Za-z_-]{20,60})['"]/);
+            if (m2) return {type: 'recaptchav2', sitekey: m2[1]};
         }
         // Cloudflare Turnstile
         const cfDiv = document.querySelector('.cf-turnstile[data-sitekey]');
@@ -1504,14 +1753,39 @@ def _solve_captcha(page, page_url: str) -> bool:
     type_map = {
         "hcaptcha": "HCaptchaTaskProxyless",
         "recaptchav2": "ReCaptchaV2TaskProxyless",
+        "recaptchav2enterprise": "ReCaptchaV2EnterpriseTaskProxyless",
         "recaptchav3": "ReCaptchaV3TaskProxyless",
         "turnstile": "AntiTurnstileTaskProxyless",
     }
+
+    # Detect if this is an invisible reCAPTCHA (no checkbox UI).
+    # Ashby and some ATS use invisible reCAPTCHA — requires isInvisible=true.
+    is_invisible = False
+    if ctype in ("recaptchav2", "recaptchav2enterprise"):
+        try:
+            invisible_check = page.evaluate("""() => {
+                // Invisible reCAPTCHA: size='invisible' on the div, or badge present, or no challenge iframe
+                const div = document.querySelector('.g-recaptcha[data-size="invisible"], .g-recaptcha[data-badge]');
+                if (div) return true;
+                const frames = Array.from(document.querySelectorAll('iframe[src*="recaptcha"]'));
+                // If only the bframe (badge) exists and no challenge iframe, it's invisible
+                const hasBadge = frames.some(f => f.src.includes('bframe'));
+                const hasChallenge = frames.some(f => f.src.includes('anchor'));
+                if (hasBadge && !hasChallenge) return true;
+                return false;
+            }""")
+            is_invisible = bool(invisible_check)
+        except Exception:
+            pass
+
     task_payload: dict = {
         "type": type_map.get(ctype, "HCaptchaTaskProxyless"),
         "websiteURL": page_url,
         "websiteKey": sitekey,
     }
+    if is_invisible:
+        task_payload["isInvisible"] = True
+        log.info("Detected invisible reCAPTCHA — setting isInvisible=true")
 
     try:
         import json as _json
@@ -1536,7 +1810,19 @@ def _solve_captcha(page, page_url: str) -> bool:
             result = _post("https://api.capsolver.com/getTaskResult",
                            {"clientKey": capsolver_key, "taskId": task_id})
             if result.get("errorId", 0) != 0:
-                log.warning("CapSolver poll error: %s", result.get("errorDescription", result))
+                err_desc = result.get("errorDescription", "")
+                # CapSolver returns "and invisible" error when it detects the captcha
+                # is invisible but we didn't pass isInvisible=true — retry with that flag.
+                if "invisible" in err_desc.lower() and not task_payload.get("isInvisible"):
+                    log.info("CapSolver: invisible reCAPTCHA detected — retrying with isInvisible=true")
+                    task_payload["isInvisible"] = True
+                    resp2 = _post("https://api.capsolver.com/createTask",
+                                  {"clientKey": capsolver_key, "task": task_payload})
+                    if resp2.get("errorId", 0) == 0:
+                        task_id = resp2["taskId"]
+                        log.info("CapSolver retry task: %s", task_id)
+                        continue  # resume polling with new task_id
+                log.warning("CapSolver poll error: %s", err_desc or result)
                 return False
             if result.get("status") == "ready":
                 sol = result.get("solution", {})
@@ -1684,7 +1970,8 @@ def _click_apply_cta(page, title: str) -> bool:
         "a:text-matches('^apply$', 'i')",
     ]
     SKIP_TEXT = {"sign in", "login", "log in", "register", "create account",
-                 "back", "return", "close", "search"}
+                 "back", "return", "close", "search",
+                 "apply with linkedin", "linkedin"}  # never use LinkedIn 1-click apply
 
     for sel in CTA_SELECTORS:
         try:
@@ -1704,7 +1991,8 @@ def _click_apply_cta(page, title: str) -> bool:
     # JS broad search — find any "apply" button/link/div that's not a nav element
     try:
         result = page.evaluate("""() => {
-            const SKIP = new Set(['sign in','login','log in','register','create account','back','search']);
+            const SKIP = new Set(['sign in','login','log in','register','create account','back','search',
+                                  'apply with linkedin','linkedin']);  // never click LinkedIn apply
             // Include ALL clickable elements — many ATS use div/span/li styled as buttons
             const all = Array.from(document.querySelectorAll(
                 'button, a, [role="button"], input[type="submit"], div[onclick], span[onclick], li[onclick], [class*="btn"], [class*="button"], [class*="apply"]'
@@ -1743,6 +2031,81 @@ def _click_apply_cta(page, title: str) -> bool:
     except Exception as e:
         log.debug("CTA click JS error: %s", e)
         return False
+
+
+def _handle_email_gate(page, flat: dict) -> bool:
+    """Detect and handle ATS pages that gate the application behind an email-first form.
+
+    Pattern: single email input + Next/Continue button (iCIMS, Breezy, etc.).
+    Returns True if email was filled and Next was clicked.
+    """
+    try:
+        email_val = flat.get("email", "")
+        if not email_val:
+            return False
+
+        email_inputs = page.query_selector_all(
+            "input[type='email'], input[placeholder*='email' i], "
+            "input[aria-label*='email' i], input[name*='email' i]"
+        )
+        visible_email_inputs = [e for e in email_inputs if e.is_visible()]
+        if not visible_email_inputs:
+            return False
+
+        body_text = (page.inner_text("body") or "").lower()
+        is_email_gate = (
+            ("enter your email" in body_text or "email address" in body_text)
+            and ("next" in body_text or "continue" in body_text)
+        )
+        if not is_email_gate:
+            return False
+
+        email_inp = visible_email_inputs[0]
+        current = ""
+        try:
+            current = email_inp.input_value() or ""
+        except Exception:
+            pass
+        if current.strip().lower() != email_val.strip().lower():
+            email_inp.click()
+            email_inp.fill(email_val)
+            page.wait_for_timeout(300)
+            log.info("[email-gate] Filled email: %s", email_val[:30])
+
+        # Click Next / Continue
+        for sel in [
+            "button:text-matches('next', 'i')",
+            "button:text-matches('continue', 'i')",
+            "input[type='submit'][value*='next' i]",
+            "input[type='submit'][value*='continue' i]",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    page.wait_for_timeout(2000)
+                    log.info("[email-gate] Clicked Next via '%s'", sel)
+                    return True
+            except Exception:
+                pass
+
+        clicked = page.evaluate("""() => {
+            for (const b of document.querySelectorAll('button, input[type="submit"], a')) {
+                const t = (b.innerText || b.value || '').trim().toLowerCase();
+                const r = b.getBoundingClientRect();
+                if ((t === 'next' || t === 'continue') && r.width > 0 && r.height > 0) {
+                    b.click(); return true;
+                }
+            }
+            return false;
+        }""")
+        if clicked:
+            page.wait_for_timeout(2000)
+            log.info("[email-gate] Clicked Next via JS fallback")
+            return True
+    except Exception as exc:
+        log.debug("[email-gate] error: %s", exc)
+    return False
 
 
 def _ask_unknown_fields(unfilled_labels: list[str], flat: dict) -> dict[str, str]:
@@ -1872,6 +2235,18 @@ def apply_via_playwright(
         except PWTimeout:
             log.warning("Page load timeout")
 
+        # ── Vision-loop singletons ────────────────────────────────────────────
+        from hireagent.apply.vision_loop import (
+            BrowserController as _BrowserController,
+            IntelligenceLayer as _IntelligenceLayer,
+            CaptchaSolver     as _CaptchaSolver,
+            vision_verified_fill as _vision_verified_fill,
+            find_submit_button_vision as _find_submit_btn_vision,
+        )
+        _nim  = _IntelligenceLayer()
+        _capt = _CaptchaSolver()
+        _bc   = _BrowserController(page)
+
         # ── SSN / fake job detection ──────────────────────────────────────────
         try:
             ssn_found = page.evaluate("""() => {
@@ -1919,11 +2294,20 @@ def apply_via_playwright(
                 return false;
             }""")
             if captcha_visible:
-                log.info("Interactive captcha detected — attempting CapSolver...")
-                solved = _solve_captcha(page, apply_url or "")
+                log.info("Interactive captcha detected — attempting CapSolver (2 attempts)...")
+                solved = False
+                for _cap_attempt in range(2):
+                    solved = _solve_captcha(page, apply_url or "")
+                    if solved:
+                        log.info("Captcha solved on attempt %d", _cap_attempt + 1)
+                        page.wait_for_timeout(2000)  # Let page process the token
+                        break
+                    if _cap_attempt < 1:
+                        log.info("Captcha solve attempt %d failed — retrying...", _cap_attempt + 1)
+                        page.wait_for_timeout(3000)
                 if not solved:
-                    log.warning("Captcha unsolvable — bailing")
-                    _tg(f"🛑 *Captcha (unsolved)* — {title}\n{apply_url}")
+                    log.warning("Captcha unsolvable after 2 attempts — bailing")
+                    _tg(f"🛑 *Captcha (unsolved after 2 attempts)* — {title}\n{apply_url}")
                     return "captcha"
                 log.info("Captcha solved — continuing")
         except Exception:
@@ -1933,10 +2317,10 @@ def apply_via_playwright(
         is_linkedin = "linkedin.com" in (apply_url or "").lower()
         if is_linkedin:
             # LinkedIn is heavy JS — give it extra time before interacting
-            page.wait_for_timeout(0)
+            page.wait_for_timeout(2500)
             _linkedin_login_if_needed(page, flat, apply_url)
             # Wait for job page to fully render after possible login redirect
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(2000)
 
             li_result = _linkedin_click_apply(page, title, context)
 
@@ -1945,10 +2329,12 @@ def apply_via_playwright(
                 try:
                     page.wait_for_selector(
                         ".jobs-easy-apply-modal, [data-test-modal='easy-apply-modal'], "
-                        ".artdeco-modal, .jobs-easy-apply-content",
-                        timeout=8000,
+                        ".artdeco-modal, .jobs-easy-apply-content, "
+                        "[role='dialog'], .jobs-apply-modal, "
+                        "div[aria-label*='Apply' i], div[aria-label*='application' i]",
+                        timeout=10000,
                     )
-                    page.wait_for_timeout(0)
+                    page.wait_for_timeout(2000)
                     log.info("LinkedIn Easy Apply modal confirmed open for '%s'", title)
                 except Exception:
                     log.warning("LinkedIn Easy Apply modal didn't confirm — proceeding anyway")
@@ -1986,25 +2372,29 @@ def apply_via_playwright(
                 return "job_expired"
 
             else:
-                # No apply button found — for LinkedIn this almost always means expired/closed
+                # Apply button not detected — could be timing issue or truly expired.
+                # The expired/closed checks earlier already catch genuine closures, so
+                # this is most likely a detection failure (button rendered late, etc.).
+                # Take a screenshot for debugging but mark as transient failure (retryable).
                 ss_fail = Path("/tmp") / f"hireagent_fail_{int(time.time())}.png"
                 try:
                     page.screenshot(path=str(ss_fail), full_page=False)
-                    _tg(f"💀 *No Apply button (expired?)* — {title}\n{apply_url}", ss_fail)
+                    _tg(f"⚠️ *Apply button not detected — will retry* — {title}\n{apply_url}", ss_fail)
                 except Exception:
-                    _tg(f"💀 *No Apply button (expired?)* — {title}\n{apply_url}")
-                # Permanent for LinkedIn — no button = closed/expired, never retry
-                if is_linkedin:
-                    return "job_expired"
+                    _tg(f"⚠️ *Apply button not detected — will retry* — {title}\n{apply_url}")
                 return RESULT_FAILED
 
         # ── Click Apply CTA for non-LinkedIn jobs (job description → application form) ──
         if not is_linkedin:
             # Extra wait for JS-heavy ATS pages to fully render
             page.wait_for_timeout(500)
+
+            # Handle iCIMS/Breezy-style email-gate pages BEFORE CTA click
+            _handle_email_gate(page, flat)
+
             cta_clicked = _click_apply_cta(page, title)
             # After CTA click, give the new page time to load
-            page.wait_for_timeout(0)
+            page.wait_for_timeout(2000)
 
             # Check for account/SSO gate — if page now demands login/register, skip
             if cta_clicked:
@@ -2029,16 +2419,26 @@ def apply_via_playwright(
                     )
                     url_sso_signals = ("login", "register", "signin", "sign-in",
                                        "applicationinit", "candidateprofile", "talentnetwork")
+                    # Account/Login required — but only if no form inputs are found
+                    visible_inputs = page.query_selector_all(
+                        "input[type='text']:visible, input[type='email']:visible, input[type='tel']:visible, "
+                        "input[type='url']:visible, input[type='number']:visible, textarea:visible"
+                    )
+                    has_form = len(visible_inputs) > 0
+                    
                     if (any(s in body_lower for s in sso_signals) or
                             any(s in url_lower for s in url_sso_signals)):
-                        log.warning("Account/SSO required — skipping: %s", page.url)
-                        _ss = Path("/tmp") / f"hireagent_sso_{int(time.time())}.png"
-                        try:
-                            page.screenshot(path=str(_ss), full_page=False)
-                            _tg(f"🔐 *Account/Login required* — skipping\n*Job:* {title}\n*ATS:* {ats.upper()}", _ss)
-                        except Exception:
-                            _tg(f"🔐 *Account/Login required* — skipping\n*Job:* {title}\n*ATS:* {ats.upper()}")
-                        return "account_required"
+                        if not has_form:
+                            log.warning("Account/SSO required — skipping: %s", page.url)
+                            _ss = Path("/tmp") / f"hireagent_sso_{int(time.time())}.png"
+                            try:
+                                page.screenshot(path=str(_ss), full_page=False)
+                                _tg(f"🔐 *Account/Login required* — skipping\n*Job:* {title}\n*ATS:* {ats.upper()}", _ss)
+                            except Exception:
+                                _tg(f"🔐 *Account/Login required* — skipping\n*Job:* {title}\n*ATS:* {ats.upper()}")
+                            return "account_required"
+                        else:
+                            log.debug("SSO keywords found, but form exists — proceeding")
                     # Also skip known account-required ATS types
                     if ats in ("ultipro", "taleo", "icims", "successfactors"):
                         # These require account creation — check if we're past the job page
@@ -2097,7 +2497,7 @@ def apply_via_playwright(
                         _tg(f"❌ *Apply button not found* — {title}\n{apply_url}", ss_no_cta)
                     except Exception:
                         _tg(f"❌ *Apply button not found* — {title}\n{apply_url}")
-                    return RESULT_FAILED
+                    return "failed:no_form_found"
                 else:
                     log.info("No Apply CTA needed — page already has %d form fields", _n_fields_now)
 
@@ -2114,7 +2514,7 @@ def apply_via_playwright(
         except Exception:
             upload_path = resume_path
         uploaded = _upload_resume(page, upload_path)
-        page.wait_for_timeout(0)
+        page.wait_for_timeout(1000)
 
         def _do_fill_pass(pg) -> tuple[int, list[str]]:
             """One full fill pass: ATS-specific + generic inputs + selects + radios."""
@@ -2128,7 +2528,34 @@ def apply_via_playwright(
                 n += _fill_radios(pg, flat)
                 return n, unf
 
-        def _llm_answer_fields(labels: list[str]) -> dict[str, str]:
+        _FORM_FILL_SYSTEM_PROMPT = """You are an expert ATS form-filling agent. Fill job application form fields using the candidate profile provided.
+
+CRITICAL:
+- Return ONLY valid JSON — no markdown fences, no explanations.
+- Never fabricate data. Use only information from the profile.
+- If a field is optional and you have no data, omit it.
+- For select/dropdown fields, only use exact values from the provided options.
+
+FIELD MAPPING RULES:
+- Name → firstName, lastName, fullName from profile
+- Email → profile.email (exact match)
+- Phone → 10-digit US format: XXXXXXXXXX
+- Salary → integer (e.g. 90000), no commas or symbols
+- Years of experience → "0-1" or "1-3" based on profile
+- Work authorization:
+  - OPT/F-1 → select "Employment Authorization Document (EAD)" or "Other" or "OPT"
+  - "Are you authorized to work in the US?" → "Yes"
+  - "Will you need sponsorship NOW?" → "No"
+  - "Will you need sponsorship in the future?" → "Yes"
+- Cover letter / essay → 2-3 sentences: skills match + work auth + availability
+- Willing to relocate → "Yes"
+- Background check → "Yes"
+- Disability/veteran EEO → "I prefer not to answer" or "I do not have a disability" / "I am not a protected veteran"
+
+RESPONSE FORMAT — return ONLY this JSON:
+{"fields": {"field_label_or_name": "value", ...}}"""
+
+        def _llm_answer_fields(labels: list[str], page_context: dict | None = None) -> dict[str, str]:
             """Call LLM once with all unknown field labels. Returns {label: answer}."""
             if not labels:
                 return {}
@@ -2139,52 +2566,67 @@ def apply_via_playwright(
                 log.warning("LLM client init failed: %s", _e)
                 return {}
 
-            p = profile.get("personal", {})
+            import json as _json
+
             edu_m = profile.get("education", {}).get("masters", {})
-            exp = profile.get("experience", {})
-            auth = profile.get("work_authorization", {})
+            skills_raw = profile.get("skills", [])
+            skills_str = ", ".join(skills_raw) if isinstance(skills_raw, list) else str(skills_raw)
 
-            profile_summary = f"""Applicant: {flat.get('full_name')}
-Email: {flat.get('email')} | Phone: {flat.get('phone_formatted')}
-Location: {flat.get('city')}, {flat.get('state')}
-Education: {edu_m.get('degree','MS')} {edu_m.get('field','Computer Science')}, {edu_m.get('school','Arizona State University')} (Expected {edu_m.get('graduation_date','Dec 2025')})
-Work Auth: OPT (F-1 Student Visa) — authorized to work in the US; will require H-1B sponsorship in future
-Years of Experience: {flat.get('years_experience', '1')}
-Skills: Python, SQL, Java, React, Node.js, AWS, Docker, Git, machine learning
-Job applying for: {title}"""
+            candidate_profile = {
+                "fullName": flat.get("full_name"),
+                "firstName": flat.get("first_name"),
+                "lastName": flat.get("last_name"),
+                "email": flat.get("email"),
+                "phone": flat.get("phone"),
+                "city": flat.get("city"),
+                "state": flat.get("state"),
+                "country": "United States",
+                "postalCode": flat.get("postal_code"),
+                "linkedinUrl": flat.get("linkedin_url"),
+                "githubUrl": flat.get("github_url"),
+                "portfolioUrl": flat.get("portfolio_url"),
+                "expectedSalary": flat.get("salary", "90000"),
+                "salaryRange": flat.get("salary_range"),
+                "yearsExperience": flat.get("years_experience", "1"),
+                "workAuthorization": "OPT (F-1 Student Visa) — authorized to work; will need H-1B sponsorship in future",
+                "degree": edu_m.get("degree", "Master of Science"),
+                "major": edu_m.get("field_primary", "Computer Science"),
+                "school": edu_m.get("school", "Arizona State University"),
+                "gpa": flat.get("gpa", "4.0"),
+                "graduationDate": "December 2025",
+                "skills": skills_str or "Python, SQL, Java, React, Node.js, AWS, Docker, Git, machine learning",
+                "targetRole": title,
+                "availability": "Immediately",
+                "relocateWilling": True,
+                "remotePreference": True,
+            }
 
-            fields_list = "\n".join(f'- "{lbl}"' for lbl in labels)
+            # Build form schema: include options if available from page_context
+            form_schema = []
+            if page_context and "fields" in page_context:
+                for f in page_context["fields"]:
+                    if f.get("label") in labels:
+                        form_schema.append(f)
+            if not form_schema:
+                form_schema = [{"label": lbl, "type": "text", "required": True} for lbl in labels]
 
-            prompt = f"""You are filling a job application form on behalf of the applicant below.
-
-{profile_summary}
-
-Return ONLY a valid JSON object mapping each field label to a SHORT, honest answer (1-2 sentences max for text, single word/number for short fields).
-Do NOT invent credentials or experience the applicant does not have.
-For salary: answer "$85,000 - $95,000" or "90000".
-For sponsorship questions: "No" if asking will you need sponsorship NOW, "Yes" if asking will you need it in future.
-For work authorization: "Yes".
-For cover letter or essay questions: write 2-3 concise sentences based on the profile.
-
-FIELDS TO FILL:
-{fields_list}
-
-Respond with ONLY the JSON, no explanation:"""
+            user_msg = f"Form fields to fill:\n{_json.dumps(form_schema, indent=2)}\n\nCandidate profile:\n{_json.dumps(candidate_profile, indent=2)}"
 
             try:
-                raw = _client.ask(prompt, temperature=0.1, max_tokens=800)
-                # Extract JSON from response
-                import json as _json
+                raw = _client.ask(user_msg, temperature=0.1, max_tokens=1024,
+                                  system_prompt=_FORM_FILL_SYSTEM_PROMPT)
                 raw = raw.strip()
-                # Strip markdown code fences if present
                 if raw.startswith("```"):
                     raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
                     raw = re.sub(r"\n?```$", "", raw)
-                answers = _json.loads(raw.strip())
+                    raw = raw.strip()
+                parsed = _json.loads(raw)
+                # Support both {"fields": {...}} and flat {label: value}
+                answers = parsed.get("fields", parsed)
                 log.info("LLM filled %d fields: %s", len(answers), list(answers.keys()))
-                return {str(k): str(v) for k, v in answers.items()}
+                return {str(k): str(v) for k, v in answers.items() if v not in (None, "", "null")}
             except Exception as _e:
-                log.warning("LLM form-fill parse failed: %s | raw=%s", _e, raw[:200] if 'raw' in dir() else "")
+                log.warning("LLM form-fill parse failed: %s | raw=%s", _e, locals().get("raw", "")[:300])
                 return {}
 
         def _ask_and_fill_unknowns(pg, unfilled: list[str]) -> int:
@@ -2205,9 +2647,34 @@ Respond with ONLY the JSON, no explanation:"""
             if not still_unknown:
                 return filled
 
-            # Pass 2: LLM for anything rule-based couldn't map
+            # Pass 2: LLM for anything rule-based couldn't map.
+            # Collect page context: for each unknown label, grab select options + input type
+            # so the LLM knows what values are actually valid.
+            page_ctx: dict = {"fields": []}
+            for lbl in still_unknown:
+                field_info: dict = {"label": lbl, "type": "text", "required": True}
+                try:
+                    el = pg.get_by_label(re.compile(re.escape(lbl), re.IGNORECASE)).first
+                    if el.is_visible(timeout=400):
+                        tag = el.evaluate("e => e.tagName.toLowerCase()")
+                        if tag == "select":
+                            field_info["type"] = "select"
+                            opts = el.query_selector_all("option")
+                            field_info["options"] = [
+                                (o.inner_text() or "").strip()
+                                for o in opts
+                                if (o.inner_text() or "").strip()
+                                and (o.inner_text() or "").strip().lower()
+                                not in ("select", "please select", "--", "-", "choose", "none", "")
+                            ][:30]
+                        else:
+                            field_info["type"] = el.get_attribute("type") or "text"
+                except Exception:
+                    pass
+                page_ctx["fields"].append(field_info)
+
             log.info("LLM assist: %d unknown fields → %s", len(still_unknown), still_unknown)
-            llm_answers = _llm_answer_fields(still_unknown)
+            llm_answers = _llm_answer_fields(still_unknown, page_context=page_ctx)
             for label, value in llm_answers.items():
                 if value and value.lower() not in ("none", "null", "n/a", ""):
                     flat[f"_custom_{label.lower()[:20]}"] = value
@@ -2218,6 +2685,24 @@ Respond with ONLY the JSON, no explanation:"""
 
         def _fill_one(pg, label: str, value: str) -> bool:
             """Try to find and fill a single field by label. Returns True if filled."""
+            # Handle unlabeled fields identified by name/placeholder/id attribute
+            if label.startswith("[unlabeled:"):
+                attr_val = label[len("[unlabeled:"):-1]
+                for sel in (
+                    f"input[name='{attr_val}']",
+                    f"input[placeholder='{attr_val}']",
+                    f"input[id='{attr_val}']",
+                    f"textarea[name='{attr_val}']",
+                ):
+                    try:
+                        el = pg.locator(sel).first
+                        if el.is_visible(timeout=400):
+                            el.fill(value)
+                            log.debug("Filled unlabeled field [%s] = '%s'", attr_val, value[:30])
+                            return True
+                    except Exception:
+                        pass
+                return False
             try:
                 el = pg.get_by_label(re.compile(re.escape(label), re.IGNORECASE)).first
                 if el.is_visible(timeout=800):
@@ -2305,36 +2790,63 @@ Respond with ONLY the JSON, no explanation:"""
                 pass
             return empty
 
-        # ── Re-check captcha after CTA click — only if visibly shown ──
-        if not is_linkedin:
-            try:
-                captcha_after = page.evaluate("""() => {
-                    const frames = Array.from(document.querySelectorAll('iframe'));
-                    for (const f of frames) {
+        # ── Re-check captcha after CTA click — use CaptchaSolver as single source of truth ──
+        try:
+            from hireagent.apply.vision_loop import CaptchaSolver as _CaptchaSolver
+            _post_click_solver = _CaptchaSolver()
+            _captcha_info = _post_click_solver._detect(page)
+
+            if _captcha_info:
+                ctype = _captcha_info.get("type", "unknown")
+                log.info("Captcha detected after CTA click (type=%s) — attempting CapSolver (3 attempts)...", ctype)
+                solved = False
+                for _cap_attempt in range(3):
+                    solved = _post_click_solver.solve(page, page.url or apply_url or "")
+                    if solved:
+                        log.info("Captcha after CTA solved on attempt %d (type=%s)", _cap_attempt + 1, ctype)
+                        page.wait_for_timeout(2500)
+                        break
+                    log.debug("CaptchaSolver attempt %d failed — retrying", _cap_attempt + 1)
+                    if _cap_attempt < 2:
+                        page.wait_for_timeout(4000)
+                if not solved:
+                    log.warning("Captcha after CTA unsolvable (type=%s) — bailing", ctype)
+                    _tg(f"🛑 *Captcha after Apply click (unsolved, type={ctype})* — {title}\n{apply_url}")
+                    return "captcha"
+                log.info("Captcha solved after CTA — continuing")
+            else:
+                # Broader fallback: check for any CAPTCHA-like visible iframe the solver missed
+                _broad_captcha = page.evaluate("""() => {
+                    const CAPTCHA_HOSTS = [
+                        'hcaptcha.com', 'recaptcha', 'turnstile', 'arkoselabs',
+                        'funcaptcha', 'datadome', 'geetest', 'cloudflare'
+                    ];
+                    for (const f of document.querySelectorAll('iframe')) {
                         const src = (f.src || '').toLowerCase();
-                        const isHcaptcha = src.includes('hcaptcha.com');
-                        const isRcV2 = src.includes('api2/bframe') || src.includes('api2/anchor');
-                        if (isHcaptcha || isRcV2) {
+                        if (CAPTCHA_HOSTS.some(h => src.includes(h))) {
                             const r = f.getBoundingClientRect();
-                            if (r.width > 10 && r.height > 10) return true;
+                            if (r.width > 10 && r.height > 10) return src;
                         }
                     }
-                    if (document.querySelector('.h-captcha[data-sitekey]')) return true;
-                    return false;
+                    return null;
                 }""")
-                if captcha_after:
-                    log.info("Captcha appeared after CTA click — attempting CapSolver...")
-                    solved = _solve_captcha(page, page.url or apply_url or "")
-                    if not solved:
-                        log.warning("Captcha after CTA unsolvable — bailing")
-                        _tg(f"🛑 *Captcha after Apply click (unsolved)* — {title}\n{apply_url}")
-                        return "captcha"
-                    log.info("Captcha solved after CTA — continuing")
-            except Exception:
-                pass
+                if _broad_captcha:
+                    log.warning("Unsupported CAPTCHA iframe detected (%s) — bailing", _broad_captcha[:80])
+                    _tg(f"🛑 *Unsupported CAPTCHA after Apply click* — {title}\n{apply_url}\nType: {_broad_captcha[:60]}")
+                    return "captcha"
+        except Exception as _ce:
+            log.debug("Post-CTA captcha check error: %s", _ce)
 
-        # ── Phase 1: initial field-by-field fill ──
+        # ── Phase 0: Vision-Verified fill (Nemotron maps fields → values) ──────
+        _bc.page = page
+        _v_filled, _v_errors = _vision_verified_fill(page, flat, _nim, _bc, _capt, apply_url or "")
+        log.info("Phase 0 vision-fill: %d fields, errors=%s", _v_filled, _v_errors or "none")
+        if _v_errors:
+            _tg(f"⚠️ *Form errors detected (vision scan)*\n{chr(10).join(_v_errors[:5])}")
+
+        # ── Phase 1: legacy ATS-specific fill (handles selects, radios, Workday) ──
         n_filled, unfilled = _do_fill_pass(page)
+        n_filled += _v_filled
         log.info("Phase 1 fill: %d fields filled, %d unknown required, resume=%s",
                  n_filled, len(unfilled), uploaded)
 
@@ -2371,7 +2883,7 @@ Respond with ONLY the JSON, no explanation:"""
         log.info("Phase 2: scrolling to top for field-by-field re-check")
         try:
             page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(0)
+            page.wait_for_timeout(800)
         except Exception:
             pass
 
@@ -2473,18 +2985,24 @@ Respond with ONLY the JSON, no explanation:"""
                 return "none"
 
         kws_submit_list = ["submit application", "submit my application", "submit", "apply now", "apply"]
-        kws_next_list = ["next", "continue", "review your application", "review", "proceed", "save and continue"]
+        kws_next_list = ["continue to next step", "next", "continue", "review your application", "review", "proceed", "save and continue", "next step"]
 
         submitted = False
         _consecutive_none = 0  # track consecutive empty button results
         for _step in range(15):  # max 15 steps in a multi-step form
-            page.wait_for_timeout(0)
+            page.wait_for_timeout(1000)
 
             # On steps after the first, re-fill any new visible fields
             if _step > 0:
+                # Vision-verified pass first
+                _bc.page = page
+                _sv, _se = _vision_verified_fill(page, flat, _nim, _bc, _capt, page.url or apply_url or "")
+                if _sv:
+                    log.info("Step %d vision-fill: %d fields", _step + 1, _sv)
+                # Legacy pass for selects/radios/Workday
                 _n, _unf = _do_fill_pass(page)
                 if _n:
-                    log.info("Step %d: filled %d more fields", _step + 1, _n)
+                    log.info("Step %d: filled %d more fields (legacy)", _step + 1, _n)
                 if _unf:
                     _ask_and_fill_unknowns(page, _unf)
                 # LinkedIn Easy Apply: resume upload may be on any step — retry if not yet uploaded
@@ -2492,7 +3010,33 @@ Respond with ONLY the JSON, no explanation:"""
                     uploaded = _upload_resume(page, upload_path)
                     if uploaded:
                         log.info("LinkedIn Easy Apply: resume uploaded on step %d", _step + 1)
-                page.wait_for_timeout(0)
+                # ── Check for CAPTCHA that appeared during the form step ──
+                try:
+                    _captcha_mid = page.evaluate("""() => {
+                        const frames = Array.from(document.querySelectorAll('iframe'));
+                        for (const f of frames) {
+                            const src = (f.src || '').toLowerCase();
+                            if (src.includes('hcaptcha.com') ||
+                                src.includes('api2/bframe') || src.includes('api2/anchor')) {
+                                const r = f.getBoundingClientRect();
+                                if (r.width > 10 && r.height > 10) return true;
+                            }
+                        }
+                        if (document.querySelector('.h-captcha[data-sitekey]')) return true;
+                        return false;
+                    }""")
+                    if _captcha_mid:
+                        log.info("CAPTCHA detected during form step %d — attempting CaptchaSolver...", _step + 1)
+                        if _capt.solve(page, page.url or apply_url or ""):
+                            log.info("Mid-form CAPTCHA solved")
+                            page.wait_for_timeout(2000)
+                        else:
+                            log.warning("Mid-form CAPTCHA unsolvable")
+                            _tg(f"🛑 *CAPTCHA during form (unsolved)* — {title}\n{apply_url}")
+                            return "captcha"
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)
 
             # LinkedIn Easy Apply: dismiss any "Discard application?" / "Not now" overlays
             if is_linkedin:
@@ -2510,7 +3054,7 @@ Respond with ONLY the JSON, no explanation:"""
                             if any(t in d_btn_text.lower() for t in ("continue", "not now")):
                                 d_btn.click()
                                 log.info("Dismissed LinkedIn overlay: '%s'", d_btn_text)
-                                page.wait_for_timeout(0)
+                                page.wait_for_timeout(600)
                                 break
                     except Exception:
                         pass
@@ -2573,6 +3117,14 @@ Respond with ONLY the JSON, no explanation:"""
             if not next_clicked and not submitted:
                 _consecutive_none += 1
                 if _consecutive_none >= 2:
+                    # ── Vision fallback: SoM screenshot → Llama-3.2 locates Submit ──
+                    log.info("No buttons found x2 — attempting vision model Submit fallback")
+                    _bc.page = page
+                    if _find_submit_btn_vision(page, _bc, _nim):
+                        log.info("Submit clicked via vision fallback (SoM)")
+                        page.wait_for_timeout(2500)
+                        submitted = True
+                        break
                     log.warning("No buttons found on 2 consecutive steps — page has no form, skipping")
                     return "failed:no_form_found"
                 log.warning("No Next or Submit button on step %d — stopping", _step + 1)
@@ -2589,7 +3141,7 @@ Respond with ONLY the JSON, no explanation:"""
             return RESULT_FAILED
 
         # ── Post-submit: wait and check for errors / "Thank you" confirmation ──
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(3000)
 
         # Check for validation errors after submit
         for _retry in range(3):
@@ -2603,7 +3155,7 @@ Respond with ONLY the JSON, no explanation:"""
 
             if not errors:
                 # No errors visible, no success yet — wait a bit more
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(2000)
                 continue
 
             # Errors found — scroll to each one, try to fix, or ask Telegram
@@ -2691,14 +3243,5 @@ Respond with ONLY the JSON, no explanation:"""
 # ── Public entry point ─────────────────────────────────────────────────────
 
 def apply_job(job: dict, profile: dict, resume_path: Path, headless: bool = False) -> str:
-    """Apply to one job. OpenClaw first, Playwright fallback. Returns status string."""
-    if check_openclaw_health():
-        log.info("OpenClaw up — trying gateway")
-        try:
-            return apply_via_openclaw(job, profile, resume_path)
-        except OpenClawUnavailableError as e:
-            log.warning("OpenClaw unavailable: %s", e)
-        except Exception as e:
-            log.warning("OpenClaw error: %s — falling back to Playwright", e)
-
+    """Apply to one job. Playwright directly (OpenClaw bypassed — unreliable). Returns status string."""
     return apply_via_playwright(job, profile, resume_path, headless=headless)
